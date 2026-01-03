@@ -8,7 +8,7 @@ st.set_page_config(
     layout="wide"
 )
 
-def detect_car_fabric_defects(image):    
+def detect_car_fabric_defects(image):
     if isinstance(image, Image.Image):
         img_array = np.array(image)
     else:
@@ -21,32 +21,39 @@ def detect_car_fabric_defects(image):
         gray = img_array
         vis_image = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
 
-    blurred = cv2.GaussianBlur(gray, (7, 7), 0)
-    edges = cv2.Canny(blurred, 50, 150)
-    kernel = np.ones((3,3), np.uint8)
-    edges_dilated = cv2.dilate(edges, kernel, iterations=1)
-    _, thresh = cv2.threshold(blurred, 80, 255, cv2.THRESH_BINARY_INV)
     
+    blurred = cv2.GaussianBlur(gray, (25, 25), 0)
+    texture_diff = cv2.absdiff(gray, blurred)
+    mean_texture = np.mean(texture_diff)
+    std_texture = np.std(texture_diff)
+    
+    threshold_value = max(30, mean_texture + 3.5 * std_texture)
+    
+    _, anomalies = cv2.threshold(texture_diff, threshold_value, 255, cv2.THRESH_BINARY)
+    
+    dents = cv2.adaptiveThreshold(
+        blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+        cv2.THRESH_BINARY_INV, 101, 15
+    )
 
-    thresh_clean = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
+    
+    total_defects = cv2.bitwise_or(anomalies, dents)
+    
+    # Morphological cleanup
+    kernel = np.ones((5,5), np.uint8)
+    total_defects = cv2.morphologyEx(total_defects, cv2.MORPH_OPEN, kernel)
+    total_defects = cv2.dilate(total_defects, kernel, iterations=2)
 
-   
+    
     defect_count = 0
+    contours, _ = cv2.findContours(total_defects, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
-    contours_edges, _ = cv2.findContours(edges_dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    for cnt in contours_edges:
+    for cnt in contours:
         area = cv2.contourArea(cnt)
-        if area > 50: 
+    
+        if 100 < area < (gray.shape[0] * gray.shape[1] * 0.5):
             x,y,w,h = cv2.boundingRect(cnt)
             cv2.rectangle(vis_image, (x,y), (x+w, y+h), (255, 0, 0), 2)
-            defect_count += 1
-
-    contours_thresh, _ = cv2.findContours(thresh_clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    for cnt in contours_thresh:
-        area = cv2.contourArea(cnt)
-        if area > 30: 
-            x,y,w,h = cv2.boundingRect(cnt)
-            cv2.rectangle(vis_image, (x,y), (x+w, y+h), (255, 0, 0), 2) 
             defect_count += 1
 
     is_flawed = defect_count > 0
@@ -56,8 +63,8 @@ def detect_car_fabric_defects(image):
         'defect_count': defect_count,
         'visualization': vis_image,
         'blurred': blurred,
-        'edges': edges_dilated,
-        'threshold': thresh_clean
+        'texture_diff': texture_diff,
+        'defect_mask': total_defects
     }
 
 st.title("Car Fabric Defect Detection")
@@ -98,16 +105,16 @@ if uploaded_file is not None:
         
     if show_debug:
         st.markdown("---")
-        st.subheader("Debug Layers (Basic CV Operations)")
+        st.subheader("Debug Layers (Statistical Analysis)")
         
         d1, d2, d3 = st.columns(3)
         
         with d1:
-            st.image(results['blurred'], caption="Gaussian Blur", use_container_width=True)
+            st.image(results['blurred'], caption="Shape (Texture Removed)", use_container_width=True)
         with d2:
-            st.image(results['edges'], caption="Canny Edges (Dilated)", use_container_width=True)
+            st.image(results['texture_diff'], caption="Texture Energy", use_container_width=True)
         with d3:
-            st.image(results['threshold'], caption="Threshold (Inverted)", use_container_width=True)
+            st.image(results['defect_mask'], caption="Statistical Outliers", use_container_width=True)
 
 else:
     st.info("Please upload a car door fabric image to begin")
