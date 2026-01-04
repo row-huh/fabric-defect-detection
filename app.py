@@ -1,120 +1,143 @@
-import streamlit as st
-from PIL import Image
-import cv2
+import os
+from glob import glob
 import numpy as np
-
-st.set_page_config(
-    page_title="Car Fabric Defect Detection",
-    layout="wide"
-)
-
-def detect_car_fabric_defects(image):
-    if isinstance(image, Image.Image):
-        img_array = np.array(image)
-    else:
-        img_array = image
-        
-    if len(img_array.shape) == 3:
-        gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
-        vis_image = img_array.copy()
-    else:
-        gray = img_array
-        vis_image = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
-
-    
-    blurred = cv2.GaussianBlur(gray, (25, 25), 0)
-    texture_diff = cv2.absdiff(gray, blurred)
-    mean_texture = np.mean(texture_diff)
-    std_texture = np.std(texture_diff)
-    
-    threshold_value = max(30, mean_texture + 3.5 * std_texture)
-    
-    _, anomalies = cv2.threshold(texture_diff, threshold_value, 255, cv2.THRESH_BINARY)
-    
-    dents = cv2.adaptiveThreshold(
-        blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-        cv2.THRESH_BINARY_INV, 101, 15
-    )
-
-    
-    total_defects = cv2.bitwise_or(anomalies, dents)
-    
-    # Morphological cleanup
-    kernel = np.ones((5,5), np.uint8)
-    total_defects = cv2.morphologyEx(total_defects, cv2.MORPH_OPEN, kernel)
-    total_defects = cv2.dilate(total_defects, kernel, iterations=2)
-
-    
-    defect_count = 0
-    contours, _ = cv2.findContours(total_defects, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
-    for cnt in contours:
-        area = cv2.contourArea(cnt)
-    
-        if 100 < area < (gray.shape[0] * gray.shape[1] * 0.5):
-            x,y,w,h = cv2.boundingRect(cnt)
-            cv2.rectangle(vis_image, (x,y), (x+w, y+h), (255, 0, 0), 2)
-            defect_count += 1
-
-    is_flawed = defect_count > 0
-
-    return {
-        'is_flawed': is_flawed,
-        'defect_count': defect_count,
-        'visualization': vis_image,
-        'blurred': blurred,
-        'texture_diff': texture_diff,
-        'defect_mask': total_defects
-    }
-
-st.title("Car Fabric Defect Detection")
-
-uploaded_file = st.file_uploader(
-    "Choose an image...",
-    type=["jpg", "jpeg", "png"]
-)
+import cv2
+import streamlit as st
+from skimage.filters import gabor
+from skimage.filters.rank import entropy
+from skimage.morphology import disk
 
 
-st.sidebar.header("Detection Settings")
-show_debug = st.sidebar.checkbox("Show Debug Layers", value=False)
+def load_image(path):
+	img = cv2.imread(path)
+	if img is None:
+		raise FileNotFoundError(f"Could not read image: {path}")
+	return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
 
-if uploaded_file is not None:
-    image = Image.open(uploaded_file)
-    st.success("Image uploaded successfully!")
-    
-    with st.spinner("Analyzing car fabric..."):
-        results = detect_car_fabric_defects(image)
-    
-    st.markdown("---")
-    
-    if results['is_flawed']:
-        st.error(f"**DEFECTS FOUND**: {results['defect_count']} issues detected")
-    else:
-        st.success("**PASS**: Fabric appears clean")
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.subheader("Original Image")
-        st.image(image, use_container_width=True)
-        
-    with col2:
-        st.subheader("Defect Visualization")
-        st.image(results['visualization'], use_container_width=True, caption="Detected Defects (Red Boxes)")
-        
-    if show_debug:
-        st.markdown("---")
-        st.subheader("Debug Layers (Statistical Analysis)")
-        
-        d1, d2, d3 = st.columns(3)
-        
-        with d1:
-            st.image(results['blurred'], caption="Shape (Texture Removed)", use_container_width=True)
-        with d2:
-            st.image(results['texture_diff'], caption="Texture Energy", use_container_width=True)
-        with d3:
-            st.image(results['defect_mask'], caption="Statistical Outliers", use_container_width=True)
+def crop_fabric_region(img_rgb):
+	gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
+	ent = entropy(gray, disk(9)).astype(np.float32)
+	ent_norm = cv2.normalize(ent, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+	_, th = cv2.threshold(ent_norm, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+	th = cv2.morphologyEx(th, cv2.MORPH_CLOSE, np.ones((15, 15), np.uint8))
+	th = cv2.morphologyEx(th, cv2.MORPH_OPEN, np.ones((9, 9), np.uint8))
+	cnts, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+	if not cnts:
+		return img_rgb, np.s_[:], th, gray
+	c = max(cnts, key=cv2.contourArea)
+	x, y, w, h = cv2.boundingRect(c)
+	crop_slice = np.s_[y : y + h, x : x + w]
+	return img_rgb[crop_slice].copy(), crop_slice, th, gray
 
-else:
-    st.info("Please upload a car door fabric image to begin")
+
+def gabor_energy_map(gray, frequencies=(0.1, 0.2, 0.3), orientations=8):
+	h, w = gray.shape
+	gray_f = gray.astype(np.float32) / 255.0
+	energy = np.zeros((h, w), dtype=np.float32)
+	for f in frequencies:
+		for k in range(orientations):
+			theta = (np.pi * k) / orientations
+			filt_real, filt_imag = gabor(gray_f, frequency=f, theta=theta)
+			energy += (filt_real**2 + filt_imag**2).astype(np.float32)
+	energy = cv2.GaussianBlur(energy, (0, 0), 1.0)
+	energy_norm = cv2.normalize(energy, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+	return energy, energy_norm
+
+
+def detect_defects_from_energy(energy):
+	bg = cv2.medianBlur(energy, 21)
+	diff = cv2.subtract(energy, bg)
+	diff_norm = cv2.normalize(diff, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+	_, mask = cv2.threshold(diff_norm, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+	mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+	mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
+	# Remove tiny components
+	cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+	cleaned = np.zeros_like(mask)
+	for c in cnts:
+		if cv2.contourArea(c) >= 50:
+			cv2.drawContours(cleaned, [c], -1, 255, -1)
+	return cleaned, diff_norm, bg
+
+
+def overlay_defects(img_rgb, mask):
+	overlay = img_rgb.copy()
+	red = np.zeros_like(overlay)
+	red[:, :, 0] = 255
+	alpha = 0.35
+	m3 = np.repeat((mask > 0)[..., None], 3, axis=2)
+	overlay[m3] = (alpha * red[m3] + (1 - alpha) * overlay[m3]).astype(np.uint8)
+	# Draw bounding boxes
+	cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+	for c in cnts:
+		if cv2.contourArea(c) < 50:
+			continue
+		x, y, w, h = cv2.boundingRect(c)
+		cv2.rectangle(overlay, (x, y), (x + w, y + h), (255, 0, 0), 2)
+	return overlay
+
+
+def process_image(path):
+	original = load_image(path)
+	cropped, crop_slice, fabric_mask, gray_full = crop_fabric_region(original)
+	gray_cropped = cv2.cvtColor(cropped, cv2.COLOR_RGB2GRAY)
+	energy_float, energy_norm = gabor_energy_map(gray_cropped)
+	defect_mask, diff_norm, bg_est = detect_defects_from_energy(energy_norm)
+	overlay = overlay_defects(cropped, defect_mask)
+	return {
+		"path": path,
+		"original": original,
+		"crop": cropped,
+		"crop_slice": crop_slice,
+		"fabric_mask": fabric_mask,
+		"gray": gray_cropped,
+		"gabor_energy": energy_norm,
+		"background": bg_est,
+		"anomaly": diff_norm,
+		"defect_mask": defect_mask,
+		"overlay": overlay,
+	}
+
+
+def main():
+	st.set_page_config(page_title="Fabric Defect Detection (Gabor)", layout="wide")
+	st.title("Fabric Defect Detection using Gabor Filters")
+	st.caption(
+		"Pipeline: crop fabric → Gabor energy → background suppression → anomaly threshold → defects"
+	)
+
+	dataset_dir = os.path.join(os.path.dirname(__file__), "dataset")
+	image_paths = sorted(glob(os.path.join(dataset_dir, "*.jpg")) + glob(os.path.join(dataset_dir, "*.jpeg")) + glob(os.path.join(dataset_dir, "*.png")))
+	if not image_paths:
+		st.error("No images found in dataset folder.")
+		return
+
+	st.sidebar.header("Parameters")
+	orientations = st.sidebar.slider("Orientations", 4, 12, 8, 1)
+
+	for p in image_paths:
+		st.subheader(os.path.basename(p))
+		result = process_image(p)
+
+		col1, col2, col3 = st.columns(3)
+		with col1:
+			st.write("Original")
+			st.image(result["original"], use_column_width=True)
+			st.write("Cropped Fabric")
+			st.image(result["crop"], use_column_width=True)
+		with col2:
+			st.write("Gabor Energy")
+			st.image(result["gabor_energy"], clamp=True, use_column_width=True)
+			st.write("Background Estimate")
+			st.image(result["background"], clamp=True, use_column_width=True)
+		with col3:
+			st.write("Anomaly Map")
+			st.image(result["anomaly"], clamp=True, use_column_width=True)
+			st.write("Defect Overlay")
+			st.image(result["overlay"], use_column_width=True)
+
+
+if __name__ == "__main__":
+	main()
+
