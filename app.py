@@ -6,6 +6,7 @@ import streamlit as st
 from skimage.filters import gabor
 from skimage.filters.rank import entropy
 from skimage.morphology import disk
+from PIL import Image
 
 
 def load_image(path):
@@ -78,6 +79,30 @@ def overlay_defects(img_rgb, mask):
 	return overlay
 
 
+def process_image_img(img_rgb, orientations=8):
+	# Crop fabric region via entropy to focus processing
+	cropped, crop_slice, fabric_mask, gray_full = crop_fabric_region(img_rgb)
+	gray_cropped = cv2.cvtColor(cropped, cv2.COLOR_RGB2GRAY)
+	# Gabor energy map (sum of squared responses)
+	_, energy_norm = gabor_energy_map(gray_cropped, orientations=orientations)
+	# Background suppression + thresholding
+	defect_mask, diff_norm, bg_est = detect_defects_from_energy(energy_norm)
+	# Overlay defects
+	overlay = overlay_defects(cropped, defect_mask)
+	return {
+		"original": img_rgb,
+		"crop": cropped,
+		"crop_slice": crop_slice,
+		"fabric_mask": fabric_mask,
+		"gray": gray_cropped,
+		"gabor_energy": energy_norm,
+		"background": bg_est,
+		"anomaly": diff_norm,
+		"defect_mask": defect_mask,
+		"overlay": overlay,
+	}
+
+
 def process_image(path):
 	original = load_image(path)
 	cropped, crop_slice, fabric_mask, gray_full = crop_fabric_region(original)
@@ -107,35 +132,35 @@ def main():
 		"Pipeline: crop fabric → Gabor energy → background suppression → anomaly threshold → defects"
 	)
 
-	dataset_dir = os.path.join(os.path.dirname(__file__), "dataset")
-	image_paths = sorted(glob(os.path.join(dataset_dir, "*.jpg")) + glob(os.path.join(dataset_dir, "*.jpeg")) + glob(os.path.join(dataset_dir, "*.png")))
-	if not image_paths:
-		st.error("No images found in dataset folder.")
-		return
-
 	st.sidebar.header("Parameters")
 	orientations = st.sidebar.slider("Orientations", 4, 12, 8, 1)
+	uploaded_file = st.file_uploader("Upload a fabric image", type=["jpg", "jpeg", "png"])
 
-	for p in image_paths:
-		st.subheader(os.path.basename(p))
-		result = process_image(p)
+	if uploaded_file is None:
+		st.info("Upload an image to analyze defects.")
+		return
 
-		col1, col2, col3 = st.columns(3)
-		with col1:
-			st.write("Original")
-			st.image(result["original"], use_column_width=True)
-			st.write("Cropped Fabric")
-			st.image(result["crop"], use_column_width=True)
-		with col2:
-			st.write("Gabor Energy")
-			st.image(result["gabor_energy"], clamp=True, use_column_width=True)
-			st.write("Background Estimate")
-			st.image(result["background"], clamp=True, use_column_width=True)
-		with col3:
-			st.write("Anomaly Map")
-			st.image(result["anomaly"], clamp=True, use_column_width=True)
-			st.write("Defect Overlay")
-			st.image(result["overlay"], use_column_width=True)
+	img = Image.open(uploaded_file).convert("RGB")
+	img_rgb = np.array(img)
+	st.subheader(uploaded_file.name)
+	result = process_image_img(img_rgb, orientations=orientations)
+
+	col1, col2, col3 = st.columns(3)
+	with col1:
+		st.write("Original")
+		st.image(result["original"], use_column_width=True)
+		st.write("Cropped Fabric")
+		st.image(result["crop"], use_column_width=True)
+	with col2:
+		st.write("Gabor Energy")
+		st.image(result["gabor_energy"], clamp=True, use_column_width=True)
+		st.write("Background Estimate")
+		st.image(result["background"], clamp=True, use_column_width=True)
+	with col3:
+		st.write("Anomaly Map")
+		st.image(result["anomaly"], clamp=True, use_column_width=True)
+		st.write("Defect Overlay")
+		st.image(result["overlay"], use_column_width=True)
 
 
 if __name__ == "__main__":
